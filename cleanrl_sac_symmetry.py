@@ -9,6 +9,8 @@ import wandb
 from torch.distributions import Normal, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 # torch.autograd.set_detect_anomaly(True)
+import matplotlib.pyplot as plt
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -220,6 +222,7 @@ def train_sac(args):
 
     returns = []
     global_step = 0
+    xy_log = []
 
     for episode in range(args.num_episodes):
         time_step = env.reset()
@@ -231,6 +234,7 @@ def train_sac(args):
                 flatten_obs(time_step.observation),  # NumPy → Tensor
                 device=device
             ).unsqueeze(0)
+            xy_log.append(obs_tensor[0, :2].detach().cpu().numpy())
 
             # ACTION SELECTION
             if global_step < args.learning_starts:
@@ -322,6 +326,19 @@ def train_sac(args):
         if (episode+1) % args.log_interval == 0:
             avg_return = np.mean(returns[-args.log_interval:])
             print(f"Episode {episode+1}, Average Return: {avg_return:.2f}")
+
+        if args.wandb and episode % args.log_interval == 0:
+            xy_array = np.array(xy_log)
+            fig, ax = plt.subplots()
+            ax.plot(xy_array[:, 0], xy_array[:, 1], marker="o")
+            ax.set_title(f"obs[:2] Trajectory, Ep {episode}")
+            ax.set_xlabel("obs[0]")
+            ax.set_ylabel("obs[1]")
+            ax.axis("equal")
+            ax.grid(True)
+            wandb.log({f"trajectory_episode_{episode}": wandb.Image(fig)})
+            plt.close(fig)
+        xy_log.clear()
 
     if args.wandb:
         wandb.finish()
