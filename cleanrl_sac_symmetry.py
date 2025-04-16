@@ -6,11 +6,14 @@ import torch.nn as nn
 import torch.optim as optim
 from dm_control import suite
 import wandb
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
+# torch.autograd.set_detect_anomaly(True)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def flatten_obs(obs_dict):
-    # return np.concatenate([v.ravel() for v in obs_dict.values()])
     return np.concatenate([v.ravel() for v in obs_dict.values()]).astype(np.float32)
 
 class ReplayBuffer:
@@ -125,50 +128,52 @@ class RotationDistribution(nn.Module):
 class ProbSymmetrizedPolicy(nn.Module):
     def __init__(self, base_actor, rotation_dist, num_samples=4):
         super().__init__()
-        self.base_actor   = base_actor
+        self.base_actor = base_actor
         self.rotation_dist = rotation_dist
-        self.num_samples  = num_samples
+        self.num_samples = num_samples
 
-    @torch.no_grad()
     def get_action_and_log_prob(self, obs):
         S = self.num_samples
-        obs_xy = obs[:, :2]  # (B,2)
-        obs_rep = obs.unsqueeze(0).expand(S, -1, -1).clone()
-        B = obs_rep.shape[1]  # recompute batch size
+        B = obs.shape[0]
 
-        # -------- sample rotations ------------------------------------------------
-        angles = self.rotation_dist.sample_angles(B, S)  # (S,B)
+        # Repeat obs for S symmetry samples
+        obs_rep = obs.unsqueeze(0).expand(S, -1, -1).clone()  # (S, B, obs_dim)
+
+        # Apply random 2D rotation to first two dims
+        angles = self.rotation_dist.sample_angles(B, S)  # (S, B)
         cos, sin = torch.cos(angles), torch.sin(angles)
-        rot_mats = torch.stack([torch.stack([cos, -sin], -1),
-                                torch.stack([sin, cos], -1)], -2)  # (S,B,2,2)
-        obs_rep[:, :, :2] = torch.einsum('sbji,bj->sbi', rot_mats, obs_xy)
+        rot_mats = torch.stack([
+            torch.stack([cos, -sin], -1),
+            torch.stack([sin,  cos], -1)
+        ], -2)  # (S, B, 2, 2)
 
-        # -------- pass through base actor ----------------------------------------
+        obs_xy = obs[:, :2]
+        # obs_rep[:, :, :2] = torch.einsum('sbji,bj->sbi', rot_mats, obs_xy)
+        rotated_xy = torch.einsum('sbji,bj->sbi', rot_mats, obs[:, :2])
+        obs_rep = torch.cat([rotated_xy, obs_rep[:, :, 2:]], dim=-1)
+
+        # Flatten (S * B, obs_dim), feed to base_actor
         mean, log_std = self.base_actor(obs_rep.reshape(S * B, -1))
-        std = log_std.exp()
-        eps = torch.randn_like(std)
-        pre_tanh = mean + std * eps
-        acts_flat = torch.tanh(pre_tanh)  # (S*B, act_dim)
+        base = Normal(mean, log_std.exp())
+        dist = TransformedDistribution(base, [TanhTransform(cache_size=1)])
+        # breakpoint()
+        actions_flat = dist.rsample()  # (S * B, act_dim)
+        log_probs_flat = dist.log_prob(actions_flat).sum(-1, keepdim=True)  # (S * B, 1)
 
-        # -------- rotate actions back --------------------------------------------
-        acts = acts_flat.view(S, B, -1)  # (S,B,act_dim)
+        # Reshape back to (S, B, ...)
+        actions = actions_flat.view(S, B, -1)
+        log_probs = log_probs_flat.view(S, B, 1)
+
+        # Rotate actions back
         inv_rot = rot_mats.transpose(-1, -2)
-        acts_xy = torch.einsum('sbji,sbj->sbi', inv_rot, acts[..., :2])
-        acts[..., :2] = acts_xy
+        rotated_xy = torch.einsum('sbji,sbj->sbi', inv_rot, actions[..., :2])
+        actions = torch.cat([rotated_xy, actions[..., 2:]], dim=-1)
 
-        # -------- log‑prob with tanh Jacobian ------------------------------------
-        # ------- log‑prob with stable Jacobian ---------------------------------
-        tanh_eps = 1e-6  # global small constant
-        log_prob_flat = (
-                -0.5 * ((eps ** 2) + 2 * log_std).sum(-1, keepdim=True)  # Normal
-                - torch.log(torch.clamp(1 - acts_flat.pow(2), min=tanh_eps)).sum(-1, keepdim=True)
-        )  # (S*B,1)
+        # Average over symmetry samples
+        action_mean = actions.mean(dim=0)       # (B, act_dim)
+        log_prob_mean = log_probs.mean(dim=0)   # (B, 1)
 
-        log_prob = log_prob_flat.view(S, B, 1)  # now S*B*1 == S*B elements
-
-        # -------- aggregate over symmetry samples -------------------------------
-        return acts.mean(0), log_prob.mean(0)  # shapes: (B,act_dim), (B,1)
-
+        return action_mean, log_prob_mean
 
 # ------------------------------------------------------------------------------
 # Main SAC training using the new ProbSymmetrizedPolicy
@@ -196,7 +201,7 @@ def train_sac(args):
     # Rotation distribution
     rot_dist = RotationDistribution().to(device)
     # Probabilistic Symmetric Actor
-    actor = ProbSymmetrizedPolicy(base_actor, rot_dist, num_samples=4).to(device)
+    actor = ProbSymmetrizedPolicy(base_actor, rot_dist, num_samples=args.num_samples).to(device)
 
     actor_optimizer = optim.Adam(list(base_actor.parameters()) + list(rot_dist.parameters()), lr=args.lr)
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.lr)
@@ -222,8 +227,6 @@ def train_sac(args):
 
         while not time_step.last():
             global_step += 1
-            # obs_array = flatten_obs(time_step.observation).astype(np.float32)
-            # obs_tensor = torch.as_tensor(obs_array, device=device).unsqueeze(0)
             obs_tensor = torch.as_tensor(
                 flatten_obs(time_step.observation),  # NumPy → Tensor
                 device=device
@@ -302,7 +305,12 @@ def train_sac(args):
                         "qf_loss": qf_loss.item(),
                         "qf1_loss": qf1_loss.item(),
                         "qf2_loss": qf2_loss.item(),
-                        "global_step": global_step
+                        "global_step": global_step,
+                        "mean_log_prob": log_prob.mean().item(),
+                        "mean_q": q_new_action.mean().item(),
+                        "qf1_val_mean": q1_val.mean().item(),
+                        "qf2_val_mean": q2_val.mean().item(),
+                        "q_target_mean": target_q.mean().item()
                     })
 
             time_step = time_step_next
@@ -332,6 +340,7 @@ def main():
     parser.add_argument("--update_every", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--wandb", action="store_true", help="Use wandb for logging if set")
+    parser.add_argument("--num_samples", type=int, default=4, help="Number of symmetry samples")
     args = parser.parse_args()
 
     print("Training SAC (Probabilistic Symmetric) on dm_control Reacher-easy task.")
