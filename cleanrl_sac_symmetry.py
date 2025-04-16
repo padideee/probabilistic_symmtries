@@ -10,7 +10,8 @@ import wandb
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def flatten_obs(obs_dict):
-    return np.concatenate([v.ravel() for v in obs_dict.values()])
+    # return np.concatenate([v.ravel() for v in obs_dict.values()])
+    return np.concatenate([v.ravel() for v in obs_dict.values()]).astype(np.float32)
 
 class ReplayBuffer:
     """Same as your original ReplayBuffer."""
@@ -20,29 +21,27 @@ class ReplayBuffer:
         self.ptr = 0
 
     def add(self, transition):
+        obs, act, rew, nxt, done = transition
+
+        # make sure rew/done are tensors on the *same device as obs*
+        if not torch.is_tensor(rew):
+            rew = torch.tensor([[rew]], dtype=torch.float32, device=obs.device)
+        if not torch.is_tensor(done):
+            done = torch.tensor([[done]], dtype=torch.float32, device=obs.device)
+
+        packed = (obs, act, rew, nxt, done)
+
         if len(self.storage) < self.capacity:
-            self.storage.append(transition)
+            self.storage.append(packed)
         else:
-            self.storage[self.ptr] = transition
+            self.storage[self.ptr] = packed
             self.ptr = (self.ptr + 1) % self.capacity
 
     def sample(self, batch_size):
-        idxs = np.random.randint(0, len(self.storage), size=batch_size)
-        obs, actions, rewards, next_obs, dones = [], [], [], [], []
-        for i in idxs:
-            o, a, r, no, d = self.storage[i]
-            obs.append(o)
-            actions.append(a)
-            rewards.append(r)
-            next_obs.append(no)
-            dones.append(d)
-        return (
-            torch.cat(obs).to(device),
-            torch.cat(actions).to(device),
-            torch.FloatTensor(rewards).unsqueeze(1).to(device),
-            torch.cat(next_obs).to(device),
-            torch.FloatTensor(dones).unsqueeze(1).to(device),
-        )
+        idx = np.random.randint(len(self.storage), size=batch_size)
+        cols = list(zip(*[self.storage[i] for i in idx]))  # 5-tuples → 5 lists
+        obs, act, rew, nxt, done = map(torch.cat, cols)  # fast, zero‑copy
+        return obs, act, rew, nxt, done
 
     def __len__(self):
         return len(self.storage)
@@ -110,53 +109,15 @@ def soft_update(source_net, target_net, tau):
 # RotationDistribution: produces a random rotation in 2D for the Reacher domain
 # ------------------------------------------------------------------------------
 class RotationDistribution(nn.Module):
-    """
-    Returns a random angle for 2D rotation, using a small MLP to produce mean/std
-    if desired. For simplicity, we’ll just return a uniform or a simple
-    normal-based angle. If you'd like a learned distribution, make a small network.
-    """
     def __init__(self):
         super().__init__()
-        # Here we’ll keep it extremely simple and produce angles with a constant std
-        # or you can make a small MLP to produce mean, log_std from obs if needed.
-        # For demonstration, let's do a trivial MLP -> (mean, log_std).
-        self.net = nn.Sequential(
-            nn.Linear(1, 64),  # example dimension
-            nn.ReLU(),
-            nn.Linear(64, 2)
-        )
+        self.log_std = nn.Parameter(torch.tensor(-2.3))   # learnable scalar σ≈0.1
 
-    def forward(self, obs):
-        """
-        obs: (batch_size, obs_dim). We could choose a smaller embedding if desired.
-        Just a minimal example here: we compress obs to 1 dimension, pass to net.
-        """
-        # Combine entire batch into single embedding for demonstration, or
-        # pick some simpler feature, etc.
-        # In practice, do something more relevant to the Reacher’s geometry.
-        with torch.no_grad():
-            # e.g. we just sum up obs for a single scalar feature:
-            scalar_feat = obs.sum(dim=1, keepdim=True)
-        x = self.net(scalar_feat)
-        mean_angle = torch.atan2(x[:, 0], x[:, 1])  # angle in [-pi, pi]
-        # You could also produce a learned log_std and sample. For simplicity,
-        # let's keep it a small constant:
-        std = 0.1  # or from a trainable param
-        return mean_angle, std
+    def sample_angles(self, batch, S):
+        # one angle per (symmetry sample, batch element)
+        eps = torch.randn(S, batch, device=self.log_std.device)
+        return eps * self.log_std.exp()  # angle ~ N(0, σ²)
 
-    def sample_rotation(self, obs):
-        mean, std = self(obs)
-        angle = mean + std * torch.randn_like(mean)  # shape [batch_size]
-        cos = torch.cos(angle)
-        sin = torch.sin(angle)
-        # Build 2x2 rotation matrix for each batch
-        # shape => (batch_size, 2, 2)
-        rot_mats = []
-        for c, s in zip(cos, sin):
-            mat = torch.tensor([[c, -s],
-                                [s,  c]], device=obs.device)
-            rot_mats.append(mat)
-        return torch.stack(rot_mats, dim=0)
 
 # ------------------------------------------------------------------------------
 # ProbSymmetrizedPolicy: the "equivariant" actor using multiple rotation samples
@@ -164,77 +125,50 @@ class RotationDistribution(nn.Module):
 class ProbSymmetrizedPolicy(nn.Module):
     def __init__(self, base_actor, rotation_dist, num_samples=4):
         super().__init__()
-        self.base_actor = base_actor
+        self.base_actor   = base_actor
         self.rotation_dist = rotation_dist
-        self.num_samples = num_samples
+        self.num_samples  = num_samples
 
-    def forward(self, obs):
-        """We won't use .forward directly, we’ll define a get_action_and_log_prob
-           in the same style as your original actor."""
-        raise NotImplementedError
-
+    @torch.no_grad()
     def get_action_and_log_prob(self, obs):
-        """
-        For each observation, sample a few random rotation matrices,
-        rotate obs -> feed to base actor -> rotate action back.
-        Combine the results (e.g. average).
-        """
-        # We'll store the final actions & log_probs from each sample
-        all_actions = []
-        all_logprobs = []
+        S = self.num_samples
+        obs_xy = obs[:, :2]  # (B,2)
+        obs_rep = obs.unsqueeze(0).expand(S, -1, -1).clone()
+        B = obs_rep.shape[1]  # recompute batch size
 
-        # Sample rotation matrices
-        rot_mats = self.rotation_dist.sample_rotation(obs)  # shape [B, 2, 2]
+        # -------- sample rotations ------------------------------------------------
+        angles = self.rotation_dist.sample_angles(B, S)  # (S,B)
+        cos, sin = torch.cos(angles), torch.sin(angles)
+        rot_mats = torch.stack([torch.stack([cos, -sin], -1),
+                                torch.stack([sin, cos], -1)], -2)  # (S,B,2,2)
+        obs_rep[:, :, :2] = torch.einsum('sbji,bj->sbi', rot_mats, obs_xy)
 
-        for _ in range(self.num_samples):
-            # Sample a new rotation matrix for each sample
-            R = self.rotation_dist.sample_rotation(obs)  # shape [B, 2, 2]
-            rotated_obs = self.apply_rotation(obs, R)    # shape same as obs
+        # -------- pass through base actor ----------------------------------------
+        mean, log_std = self.base_actor(obs_rep.reshape(S * B, -1))
+        std = log_std.exp()
+        eps = torch.randn_like(std)
+        pre_tanh = mean + std * eps
+        acts_flat = torch.tanh(pre_tanh)  # (S*B, act_dim)
 
-            # Feed rotated obs to the base actor
-            # action for rotated obs
-            action_rot, logp_rot = self.base_actor.get_action_and_log_prob(rotated_obs)
-            # Now rotate the (first 2 dims) of action back:
-            # (Assuming Reacher actions are 2D or more, you must define how to rotate them.)
-            # If action_dim=2: we just rotate both. If you have more dims, rotate the first two,
-            # keep others the same. Example below assumes act_dim=2:
-            true_action = self.apply_rotation_inverse(action_rot, R)
-            all_actions.append(true_action)
-            all_logprobs.append(logp_rot)
+        # -------- rotate actions back --------------------------------------------
+        acts = acts_flat.view(S, B, -1)  # (S,B,act_dim)
+        inv_rot = rot_mats.transpose(-1, -2)
+        acts_xy = torch.einsum('sbji,sbj->sbi', inv_rot, acts[..., :2])
+        acts[..., :2] = acts_xy
 
-        # Average
-        final_actions = torch.mean(torch.stack(all_actions, dim=0), dim=0)
-        final_logprobs = torch.mean(torch.stack(all_logprobs, dim=0), dim=0)
-        return final_actions, final_logprobs
+        # -------- log‑prob with tanh Jacobian ------------------------------------
+        # ------- log‑prob with stable Jacobian ---------------------------------
+        tanh_eps = 1e-6  # global small constant
+        log_prob_flat = (
+                -0.5 * ((eps ** 2) + 2 * log_std).sum(-1, keepdim=True)  # Normal
+                - torch.log(torch.clamp(1 - acts_flat.pow(2), min=tanh_eps)).sum(-1, keepdim=True)
+        )  # (S*B,1)
 
-    @staticmethod
-    def apply_rotation(obs, rotation_matrix):
-        """
-        Example if we want to treat the first 2 dims of obs as x,y and rotate them.
-        If your Reacher observation is larger, you’d need to decide exactly what to rotate.
-        For demonstration, let's assume obs.shape = [B, obs_dim], and we rotate just the first 2.
-        """
-        obs_rotated = obs.clone()
-        # Extract x,y
-        xy = obs_rotated[:, :2]  # shape [B,2]
-        # matrix multiply for each batch
-        # R shape [B,2,2], xy shape [B,2], result shape [B,2]
-        xy_rot = torch.einsum('bij, bj->bi', rotation_matrix, xy)
-        obs_rotated[:, :2] = xy_rot
-        return obs_rotated
+        log_prob = log_prob_flat.view(S, B, 1)  # now S*B*1 == S*B elements
 
-    @staticmethod
-    def apply_rotation_inverse(action, rotation_matrix):
-        """
-        Rotate the first 2 dims of the action back by R^T.
-        """
-        act_out = action.clone()
-        xy = act_out[:, :2]  # shape [B,2]
-        # rotation_matrix^T is the inverse
-        rot_T = rotation_matrix.transpose(1,2)
-        xy_inv = torch.einsum('bij, bj->bi', rot_T, xy)
-        act_out[:, :2] = xy_inv
-        return act_out
+        # -------- aggregate over symmetry samples -------------------------------
+        return acts.mean(0), log_prob.mean(0)  # shapes: (B,act_dim), (B,1)
+
 
 # ------------------------------------------------------------------------------
 # Main SAC training using the new ProbSymmetrizedPolicy
@@ -288,8 +222,12 @@ def train_sac(args):
 
         while not time_step.last():
             global_step += 1
-            obs_array = flatten_obs(time_step.observation)
-            obs_tensor = torch.FloatTensor(obs_array).unsqueeze(0).to(device)
+            # obs_array = flatten_obs(time_step.observation).astype(np.float32)
+            # obs_tensor = torch.as_tensor(obs_array, device=device).unsqueeze(0)
+            obs_tensor = torch.as_tensor(
+                flatten_obs(time_step.observation),  # NumPy → Tensor
+                device=device
+            ).unsqueeze(0)
 
             # ACTION SELECTION
             if global_step < args.learning_starts:
@@ -307,8 +245,8 @@ def train_sac(args):
             ep_return += reward
 
             done = time_step_next.last()
-            next_obs_array = flatten_obs(time_step_next.observation)
-            next_obs_tensor = torch.FloatTensor(next_obs_array).unsqueeze(0).to(device)
+            next_obs_array = flatten_obs(time_step_next.observation).astype(np.float32)
+            next_obs_tensor = torch.as_tensor(next_obs_array, device=device).unsqueeze(0)
 
             replay_buffer.add((
                 obs_tensor,
