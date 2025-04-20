@@ -133,7 +133,6 @@ def soft_update(source, target, tau):
         # tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
 
-
 # -----------------------------------------------------------------------------
 # Rotation Distributions
 # -----------------------------------------------------------------------------
@@ -165,6 +164,31 @@ class UniformRotationDistribution(nn.Module):
         angles = (torch.rand(S, B, device=obs.device) * 2 * math.pi) - math.pi
         return angles, math.log(2.0 * math.pi)
 
+
+class CanonicalRotationDistribution(nn.Module):
+    def __init__(self, obs_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+                         nn.Linear(obs_dim, hidden), nn.ReLU(),
+                         nn.Linear(hidden, hidden), nn.ReLU())
+        self.mean = nn.Linear(hidden, 1)
+
+    def sample_angles(self, obs, S):
+        # ignore S — we only ever use one sample
+        h = self.net(obs)
+        m = self.mean(h)            # (B,1)
+        angles = m.T                     # (1,B)  — same as mean for each sample
+        entropy = 0.0                    # we’re deterministic
+        return angles, entropy
+
+class IdentityRotationDistribution(nn.Module):
+    """Always return angle=0 and entropy=0, for S=1."""
+    def sample_angles(self, obs, S):
+        B = obs.size(0)
+        # one zero‐angle per element
+        angles = torch.zeros(S, B, device=obs.device)
+        entropy = 0.0
+        return angles, entropy
 
 # -----------------------------------------------------------------------------
 # Probabilistic Symmetrised Policy (returns angles too)
@@ -233,10 +257,8 @@ class ProbSymmetrizedPolicy(nn.Module):
             return act_mean, logp_mean, angle_entropy, angles
         return act_mean, logp_mean, angle_entropy
 
-    @staticmethod
-    def _apply_R(R, vec):
+    def _apply_R(self, R, vec):
         return torch.einsum('sbji,bj->sbi', R, vec)
-
 
 # -----------------------------------------------------------------------------
 # Visualisation helper
@@ -364,9 +386,16 @@ def train_sac(args):
     tgt_qf1.load_state_dict(qf1.state_dict()); tgt_qf2.load_state_dict(qf2.state_dict())
 
     base_actor = BaseActor(obs_dim, act_dim).to(device)
-    rot_dist = UniformRotationDistribution() if args.rotation_dist == "uniform" else RotationDistribution(obs_dim)
-    rot_dist = rot_dist.to(device)
-    actor = ProbSymmetrizedPolicy(base_actor, rot_dist, num_samples=args.num_samples).to(device)
+    if args.no_sym:
+        rot_dist = IdentityRotationDistribution()
+        actor = ProbSymmetrizedPolicy(base_actor, rot_dist, num_samples=1).to(device)
+    elif args.canonicalize:
+        rot_dist  = CanonicalRotationDistribution(obs_dim).to(device)
+        actor = ProbSymmetrizedPolicy(base_actor, rot_dist , num_samples=1).to(device)
+    else:
+        rot_dist = (UniformRotationDistribution() if args.rotation_dist == 'uniform'
+                    else RotationDistribution(obs_dim).to(device))
+        actor = ProbSymmetrizedPolicy(base_actor, rot_dist, args.num_samples).to(device)
 
     q_opt = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.lr)
     actor_opt = optim.Adam(list(base_actor.parameters()) + list(rot_dist.parameters()), lr=args.lr)
@@ -384,6 +413,7 @@ def train_sac(args):
         ts = env.reset(); ep_ret = 0.0; step_idx = 0
         while not ts.last():
             global_step += 1; step_idx += 1
+            print("Episode: ", ep, "Episode step: ", step_idx)
             obs = torch.tensor(flatten_obs(ts.observation), device=device).unsqueeze(0)
             with torch.no_grad():
                 if global_step < args.learning_starts:
@@ -455,6 +485,9 @@ def cli():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--rotation_dist", choices=["uniform", "learned"], default="learned")
     p.add_argument("--angle_ent_coef", type=float, default=0.01)
+    p.add_argument('--no_sym', action='store_true', help='Use plain SAC without any rotation symmetrization')
+    p.add_argument('--canonicalize', action='store_true', help='Use a deterministic canonicalizer instead of sampling')
+
     args = p.parse_args()
 
     os.environ["MUJOCO_GL"] = "egl"
