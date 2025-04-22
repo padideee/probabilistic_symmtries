@@ -26,6 +26,7 @@ from torch.distributions.transforms import TanhTransform
 import matplotlib.pyplot as plt
 import imageio
 import wandb
+# from gymnasium import ObservationWrapper
 
 from utils.plotting import render_side_by_side  # unchanged helper supplied by user
 
@@ -42,12 +43,36 @@ def set_global_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def flatten_obs(obs_dict):
-    return np.concatenate([v.ravel() for v in obs_dict.values()]).astype(np.float32)
+def flatten_obs(obs_dict, mask_frac: float = 0.0):
+    # 1) flatten
+    flat = np.concatenate([v.ravel() for v in obs_dict.values()]).astype(np.float32)
+
+    # 2) occlude a random subset
+    if mask_frac > 0.0:
+        D = flat.size
+        k = int(np.floor(mask_frac * D))
+        if k > 0:
+            idx = np.random.choice(D, k, replace=False)
+            flat[idx] = 0.0
+
+    return flat
 
 def check(name, t):
     if torch.isnan(t).any():
         raise RuntimeError(f"NaNs after {name}")
+
+def occlude_flat_obs(obs_flat: np.ndarray, mask_frac: float) -> np.ndarray:
+    """
+    Zero out `mask_frac` fraction of entries in the 1‑D observation array.
+    """
+    flat = obs_flat.copy()
+    N = flat.size
+    k = int(np.floor(mask_frac * N))
+    if k > 0:
+        idx = np.random.choice(N, k, replace=False)
+        flat[idx] = 0.0
+    return flat
+
 
 # -----------------------------------------------------------------------------
 # Replay Buffer (unchanged logic)
@@ -377,6 +402,7 @@ def train_sac(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     env = suite.load("reacher", "easy", task_kwargs={"random": np.random.RandomState(args.seed)})
+    # env = OccludeObs(env, mask_frac=0.2)
     obs_dim = sum(np.prod(v.shape) for v in env.observation_spec().values())
     act_dim = env.action_spec().shape[0]
 
@@ -410,11 +436,14 @@ def train_sac(args):
     global_step = 0
 
     for ep in range(args.num_episodes):
-        ts = env.reset(); ep_ret = 0.0; step_idx = 0
+        if args.change_task and ep == args.episode_for_change_task:
+            env = suite.load("reacher", "hard", task_kwargs={"random": np.random.RandomState(args.seed)})
+        else:
+            ts = env.reset()
+        ep_ret = 0.0; step_idx = 0
         while not ts.last():
             global_step += 1; step_idx += 1
-            print("Episode: ", ep, "Episode step: ", step_idx)
-            obs = torch.tensor(flatten_obs(ts.observation), device=device).unsqueeze(0)
+            obs = torch.tensor(flatten_obs(ts.observation, mask_frac=args.mask_frac), device=device).unsqueeze(0)
             with torch.no_grad():
                 if global_step < args.learning_starts:
                     act = np.random.uniform(env.action_spec().minimum, env.action_spec().maximum, size=env.action_spec().shape)
@@ -425,7 +454,7 @@ def train_sac(args):
             ts_next = env.step(act)
             reward = ts_next.reward or 0.0; ep_ret += reward
             done = ts_next.last()
-            next_obs = torch.tensor(flatten_obs(ts_next.observation), device=device).unsqueeze(0)
+            next_obs = torch.tensor(flatten_obs(ts_next.observation, mask_frac=args.mask_frac), device=device).unsqueeze(0)
             replay.add((obs, torch.tensor(act, device=device).unsqueeze(0).float(), reward, next_obs, float(done)))
 
             # heuristic success: reward close to 1
@@ -487,6 +516,9 @@ def cli():
     p.add_argument("--angle_ent_coef", type=float, default=0.01)
     p.add_argument('--no_sym', action='store_true', help='Use plain SAC without any rotation symmetrization')
     p.add_argument('--canonicalize', action='store_true', help='Use a deterministic canonicalizer instead of sampling')
+    p.add_argument('--change_task', action='store_true', help='Change task')
+    p.add_argument("--episode_for_change_task", type=int, default=200)
+    p.add_argument("--mask_frac", type=float, default=0.0, help="Fraction of observation to occlude")
 
     args = p.parse_args()
 

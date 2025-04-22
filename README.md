@@ -1,13 +1,14 @@
 # probabilistic_symmtries
 ```
-pip install dm_control, torch, imageio, wandb, matplotlib, scikit-learn, opencv-python, imageio[ffmpeg]
+pip install dm_control, torch, imageio, wandb, matplotlib 
 ```
+and few other dependencies....
 
-# Run
-export MUJOCO_GL=egl
 
+# To run 
 ```
-python train.py name="test"
+python symmetries_with_baseline.py 
 ```
+To run the code, use the appropariate flags for baselines, the default is to run for Prob. Symm. algorithm with 4 rotation samples and learned normal distribution.
 
 
