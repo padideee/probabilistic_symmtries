@@ -28,4 +28,6 @@ rm -rf $SLURM_TMPDIR/symmetry_RL  # Remove folder if it already exists
 git clone https://github.com/sahandrez/symmetry_RL.git $SLURM_TMPDIR/symmetry_RL
 # Remove the dependencies in setup.py to avoid installation errors
 sed -i "/install_requires=\[/,/]/c\install_requires=[]," $SLURM_TMPDIR/symmetry_RL/setup.py
+# Add the raw angles as observations of the environment
+sed -i '209 i\        obs["euler"] = transformations.quat_to_euler(physics.position())' $SLURM_TMPDIR/symmetry_RL/rotate_suite/suite/rotate.py
 pip install $SLURM_TMPDIR/symmetry_RL/
