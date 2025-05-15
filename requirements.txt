@@ -1,0 +1,8 @@
+torch==2.7.0
+opencv-python==4.11.0.86
+scikit_learn==1.6.1
+dm_control==1.0.30
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+matplotlib==3.10.3
+wandb==0.19.11
